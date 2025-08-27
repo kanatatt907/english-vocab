@@ -18,15 +18,21 @@ quiz_mode = st.sidebar.radio(
     index=0,
 )
 
+mode_choice = st.sidebar.radio("練習模式", ["一般模式", "錯題本模式"], index=0, help="錯題本模式只考你先前做錯的題目")
 items_per_round = st.sidebar.slider("Questions per round", 5, 50, 10, step=5)
 shuffle_each_question = st.sidebar.checkbox("Shuffle options each question", value=True)
 show_examples = st.sidebar.checkbox("Show example sentences (if available)", value=False)
 
 auto_delay = st.sidebar.slider(
     "Auto-advance delay (sec)",
-    0.0, 3.0, 1.5, 0.1,
-    help="0 = 不自動，需按 Next；>0 = 顯示結果後延遲再自動換題"
+    0.0, 3.0, 1.8, 0.1,
+    help="0 = 不自動，需按 Next；>0 = 顯示結果後延遲再自動換題（對錯一視同仁）"
 )
+
+st.sidebar.markdown("---")
+if st.sidebar.button("🧹 清空錯題本", use_container_width=True):
+    st.session_state["wrong_book"] = []
+    st.success("錯題本已清空。")
 
 # ================================ Helpers ======================================
 def load_excel(file_bytes: bytes) -> dict:
@@ -89,17 +95,28 @@ def pick_options(n_total, correct_idx, k=4):
     random.shuffle(opts)
     return opts
 
+def add_to_wrong_book(word: str, definition: str, example: str | None):
+    # 避免重複加入
+    for rec in st.session_state["wrong_book"]:
+        if rec["word"] == word and rec["definition"] == definition:
+            return
+    st.session_state["wrong_book"].append({"word": word, "definition": definition, "example": example})
+
+def remove_from_wrong_book(word: str, definition: str):
+    st.session_state["wrong_book"] = [
+        rec for rec in st.session_state["wrong_book"]
+        if not (rec["word"] == word and rec["definition"] == definition)
+    ]
+
 def next_question(state):
     data = state["data"]
     if not state["indices_left"]:
-        # reset a new shuffled round
         idx = list(range(len(data)))
         random.shuffle(idx)
         state["indices_left"] = idx[:]
     q_idx = state["indices_left"].pop()
     state["current_idx"] = q_idx
 
-    # build options
     if state["mode"] == "Definition ➜ Word (選詞)":
         state["prompt_text"] = data.loc[q_idx, "definition"]
         state["prompt_is_definition"] = True
@@ -113,19 +130,22 @@ def next_question(state):
         state["options_idx"] = opts_idx
         state["options_text"] = [data.loc[i, "definition"] for i in opts_idx]
 
-    if shuffle_each_question:
+    if st.session_state.get("shuffle_each_question_flag", True):
         pair = list(zip(state["options_idx"], state["options_text"]))
         random.shuffle(pair)
         state["options_idx"], state["options_text"] = map(list, zip(*pair))
 
     state["selected"] = None
-    # when manual mode (auto_delay==0), we'll show Next button after submit
     if "await_next" not in st.session_state:
         st.session_state.await_next = False
 
 def ensure_session():
     if "stats" not in st.session_state:
         st.session_state.stats = {"xp": 0, "correct": 0, "total": 0, "streak": 0}
+    if "wrong_book" not in st.session_state:
+        st.session_state.wrong_book = []
+    # 把 sidebar 的 shuffle 勾選存起來，供 next_question 使用
+    st.session_state.shuffle_each_question_flag = shuffle_each_question
 
 # ================================ Load Data ====================================
 categories = build_vocab_bank(uploaded)
@@ -136,24 +156,36 @@ if not categories:
 
 ensure_session()
 
-# 類別選擇
+# 類別選擇（一般模式要選 sheet；錯題本模式忽略）
 cat_names = list(categories.keys())
-selected_cat = st.selectbox("Category / 類別", cat_names, index=0)
+if mode_choice == "一般模式":
+    selected_cat = st.selectbox("Category / 類別", cat_names, index=0)
+else:
+    selected_cat = None  # 錯題本模式不需要 sheet
 
-# 取資料
-df = categories[selected_cat].copy()
-if len(df) < 2:
-    st.warning("這個類別有效詞條少於 2 筆，選擇其它類別或補充資料。")
+# 取資料：一般模式=從選定 sheet；錯題本模式=從 wrong_book
+if mode_choice == "一般模式":
+    df_base = categories[selected_cat].copy()
+else:
+    if len(st.session_state.wrong_book) == 0:
+        st.warning("你的錯題本目前是空的。請先在『一般模式』做題累積錯題。")
+        st.stop()
+    df_base = pd.DataFrame(st.session_state.wrong_book)
+
+if len(df_base) < 2:
+    st.warning("有效詞條少於 2 筆，請更換類別或補充資料。")
     st.stop()
 
-# 初始化 / 模式或類別變更時重置
+# 初始化 / 模式或類別或題型變更時重置
 if ("mode" not in st.session_state) or (st.session_state.mode != quiz_mode) or \
    ("cat" not in st.session_state) or (st.session_state.cat != selected_cat) or \
-   ("data" not in st.session_state):
+   ("data" not in st.session_state) or \
+   ("practice_mode" not in st.session_state) or (st.session_state.practice_mode != mode_choice):
     st.session_state.mode = quiz_mode
     st.session_state.cat = selected_cat
-    st.session_state.data = df
-    indices = list(range(len(df)))
+    st.session_state.practice_mode = mode_choice
+    st.session_state.data = df_base.reset_index(drop=True)
+    indices = list(range(len(st.session_state.data)))
     random.shuffle(indices)
     st.session_state.indices_left = indices[:]
     st.session_state.stats = {"xp": 0, "correct": 0, "total": 0, "streak": 0}
@@ -176,16 +208,18 @@ with c4:
 
 st.divider()
 
-# 題幹
 st.subheader("Definition" if st.session_state.get("prompt_is_definition", True) else "Word")
 st.write(st.session_state["prompt_text"])
 
-# 例句
+# 例句（僅一般模式時顯示來源例句；錯題本若有也照樣顯示）
 if show_examples:
-    ex = st.session_state.data.loc[st.session_state["current_idx"], "example"]
-    if pd.notna(ex) and str(ex).strip():
-        with st.expander("Example sentence"):
-            st.write(str(ex))
+    try:
+        ex = st.session_state.data.loc[st.session_state["current_idx"], "example"]
+        if pd.notna(ex) and str(ex).strip():
+            with st.expander("Example sentence"):
+                st.write(str(ex))
+    except Exception:
+        pass
 
 # 選項
 choice = st.radio(
@@ -213,22 +247,33 @@ with b1:
             correct_idx = st.session_state["current_idx"]
             is_correct  = (picked_idx == correct_idx)
 
+            # 正解/誤答處理
+            word_corr = st.session_state.data.loc[correct_idx, "word"]
+            def_corr  = st.session_state.data.loc[correct_idx, "definition"]
+            ex_corr   = st.session_state.data.loc[correct_idx, "example"] if "example" in st.session_state.data.columns else None
+
             if is_correct:
                 st.success("✅ Correct! +1 XP")
                 st.session_state.stats["xp"] += 1
                 st.session_state.stats["correct"] += 1
                 st.session_state.stats["streak"] += 1
+                # 在錯題本模式下，答對即移除該題
+                if mode_choice == "錯題本模式":
+                    remove_from_wrong_book(word_corr, def_corr)
             else:
-                ans_text = (
-                    st.session_state.data.loc[correct_idx, "word"]
-                    if st.session_state.get("prompt_is_definition", True)
-                    else st.session_state.data.loc[correct_idx, "definition"]
-                )
-                st.error(f"❌ Wrong. Answer: {ans_text}")
+                st.error(f"❌ Wrong. Answer: {word_corr if st.session_state.get('prompt_is_definition', True) else def_corr}")
                 st.session_state.stats["streak"] = 0
+                # 在一般模式下，答錯加入錯題本
+                if mode_choice == "一般模式":
+                    add_to_wrong_book(word_corr, def_corr, ex_corr)
 
+            # 換題邏輯：自動 or 手動
             if auto_delay > 0:
-                time.sleep(auto_delay)          # ✅ 對錯都延遲
+                time.sleep(auto_delay)          # 對錯一致延遲
+                # 如果錯題本模式且已被清空，提示並退出
+                if mode_choice == "錯題本模式" and len(st.session_state.wrong_book) == 0:
+                    st.info("🎉 錯題本已清空！切回『一般模式』繼續練習吧。")
+                    st.stop()
                 next_question(st.session_state)
                 st.rerun()
             else:
@@ -250,6 +295,10 @@ with b2:
 
 with b3:
     if st.button("Reset round", use_container_width=True):
+        # 重置當前題庫（一般模式=當前 sheet；錯題模式=當前錯題集）
+        st.session_state.data = (categories[selected_cat].copy().reset_index(drop=True)
+                                 if mode_choice == "一般模式"
+                                 else pd.DataFrame(st.session_state.wrong_book).reset_index(drop=True))
         idx = list(range(len(st.session_state.data)))
         random.shuffle(idx)
         st.session_state.indices_left = idx[:]
@@ -257,4 +306,5 @@ with b3:
         next_question(st.session_state)
         st.rerun()
 
-st.caption("Tip: 題目來自你上傳的檔案；切換類別＝切換 sheet。CSV 視為單一類別。")
+st.caption("Tip: 一般模式可累積錯題；錯題本模式只練錯過的題，答對即自動移除。CSV 視為單一類別。")
+
