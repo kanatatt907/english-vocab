@@ -262,7 +262,7 @@ else:
 if mode_choice == "一般模式":
     df_base = categories[selected_cat].copy()
 else:
-    if len(st.session_state.wwrong_book := st.session_state.get("wrong_book", [])) == 0:
+    if len(st.session_state.get("wrong_book", [])) == 0:
         st.warning("你的錯題本目前是空的。請先在『一般模式』做題累積錯題。")
         st.stop()
     df_base = pd.DataFrame(st.session_state.wrong_book)
